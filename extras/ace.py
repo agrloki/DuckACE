@@ -121,6 +121,8 @@ class DuckAce:
         if not 'id' in request:
             request['id'] = self._request_id
             self._request_id += 1
+            if self._request_id >= 300000:
+                self._request_id = 0
 
         payload = json.dumps(request)
         payload = bytes(payload, 'utf-8')
