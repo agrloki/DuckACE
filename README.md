@@ -148,3 +148,60 @@ Copy
 serial: /dev/ttyACM0  # явное указание
 # или
 serial: auto         # автоопределение
+
+Find_by-id_extended
+Гибкий поиск по ID:
+
+usb-ANYCUBIC_ACE_1-if* - ловит любые окончания (if00, if01 и т.д.)
+
+Дополнительно ищет usb-ANYCUBIC* на случай других вариантов именования
+
+Подробное логирование:
+
+python
+Copy
+logging.info(f"Found ACE devices by ID: {ace_devices}")
+Помогает при отладке подключения.
+
+Расширенные критерии поиска:
+
+Проверка VID/PID для популярных чипов (STM32, CH340)
+
+Поиск по описанию порта в верхнем регистре (ANYCUBIC ACE → anycubic ace)
+
+Резервные варианты:
+
+python
+Copy
+['/dev/ttyACM*', '/dev/ttyUSB*']  # Стандартные пути
+Пример работы:
+При подключении устройства:
+
+Copy
+[INFO] Found ACE devices by ID: ['/dev/serial/by-id/usb-ANYCUBIC_ACE_1-if00']
+Если изменился ID:
+
+Copy
+[INFO] Found ACE devices by ID: ['/dev/serial/by-id/usb-ANYCUBIC_ACE_1-if01']
+Дополнительная страховка:
+Можно добавить udev-правила для создания стабильного симлинка:
+
+Создайте файл /etc/udev/rules.d/99-anycubic-ace.rules:
+
+bash
+Copy
+SUBSYSTEM=="tty", ATTRS{idVendor}=="0483", ATTRS{idProduct}=="5740", SYMLINK+="anycubic_ace"
+(замените VID/PID на реальные)
+
+Перезагрузите udev:
+
+bash
+Copy
+sudo udevadm control --reload-rules
+sudo udevadm trigger
+Теперь можно использовать /dev/anycubic_ace в конфигурации:
+
+ini
+Copy
+[ace]
+serial: /dev/anycubic_ace
