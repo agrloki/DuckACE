@@ -178,7 +178,7 @@ class BunnyAce:
             payload +
             struct.pack('<H', crc) +
             bytes([0xFE])
-        
+        )
         try:
             self._serial.write(packet)
             self.send_time = time.time()
@@ -209,7 +209,7 @@ class BunnyAce:
 
         def callback(response):
             if response.get('code', 0) != 0:
-                gcmd.respond_error(f"ACE Error: {response.get('msg', 'Unknown error')")
+                gcmd.respond_error(f"ACE Error: {response.get('msg', 'Unknown error')}")
             else:
                 gcmd.respond_info(f"Drying started at {temperature}°C for {duration} minutes")
 
@@ -226,7 +226,7 @@ class BunnyAce:
         """Остановка сушки"""
         def callback(response):
             if response.get('code', 0) != 0:
-                gcmd.respond_error(f"ACE Error: {response.get('msg', 'Unknown error')")
+                gcmd.respond_error(f"ACE Error: {response.get('msg', 'Unknown error')}")
             else:
                 gcmd.respond_info("Drying stopped")
 
