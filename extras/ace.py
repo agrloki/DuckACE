@@ -253,7 +253,7 @@ class DuckAce:
     def _handle_ready(self):
         logging.info('ACE: Connecting to ' + self.serial_name)
 
-        # We can catch timing where ACE reboots itself when no data is available from host. We're avoiding it with this hack
+        # We? can catch timing where ACE reboots itself when no data is available from host. We're avoiding it with this hack
         self._connected = False
         for i in range(0, 10):
             try:
