@@ -601,7 +601,7 @@ def _monitor_assist_hits(self, eventtime):
                 eventtime = self.reactor.pause(eventtime + 0.05)
             
             # Проверяем количество срабатываний
-            if status_result['count'] >= 15:
+            if status_result['count'] >= 1:
                 logging.info(f"Stopping feed assist (hit count: {status_result['count']})")
                 
                 def stop_callback(response):
