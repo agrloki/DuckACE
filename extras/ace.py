@@ -329,7 +329,7 @@ def _reader_loop(self):
         except Exception as e:
             logging.error(f"Reader error: {traceback.format_exc()}")
             time.sleep(0.1)
-            
+
     # def _reader_loop(self):
     #     """Цикл чтения данных от устройства"""
     #     while self._connected:
@@ -531,22 +531,66 @@ def _reader_loop(self):
             "params": {"index": index}
         }, callback)
 
-    def _park_to_toolhead(self, index: int):
-        """Внутренний метод парковки филамента"""
-        def callback(response):
-            if response.get('code', 0) != 0:
-                raise ValueError(f"ACE Error: {response.get('msg', 'Unknown error')}")
+    # def _park_to_toolhead(self, index: int):
+    #     """Внутренний метод парковки филамента"""
+    #     def callback(response):
+    #         if response.get('code', 0) != 0:
+    #             raise ValueError(f"ACE Error: {response.get('msg', 'Unknown error')}")
             
-            self._assist_hit_count = 0
-            self._last_assist_count = 0
-            self._park_in_progress = True
-            self._park_index = index
-            self.dwell(0.3)
+    #         self._assist_hit_count = 0
+    #         self._last_assist_count = 0
+    #         self._park_in_progress = True
+    #         self._park_index = index
+    #         self.dwell(0.3)
 
-        self.send_request({
-            "method": "start_feed_assist",
-            "params": {"index": index}
-        }, callback)
+    #     self.send_request({
+    #         "method": "start_feed_assist",
+    #         "params": {"index": index}
+    #     }, callback)
+
+    def _park_to_toolhead(self, index: int):
+ #   """Внутренний метод парковки филамента с контролем количества срабатываний ассистента"""
+       def callback(response):
+        if response.get('code', 0) != 0:
+            raise ValueError(f"ACE Error: {response.get('msg', 'Unknown error')}")
+        
+        # Сброс счетчиков и начало процесса парковки
+        self._assist_hit_count = 0
+        self._last_assist_count = 0
+        self._park_in_progress = True
+        self._park_index = index
+        
+        # Запускаем мониторинг hit count в отдельном потоке
+        self.reactor.register_callback(self._monitor_assist_hits)
+
+    # Включаем feed assist для указанного слота
+    self.send_request({
+        "method": "start_feed_assist",
+        "params": {"index": index}
+    }, callback)
+
+def _monitor_assist_hits(self, eventtime):
+    """Мониторинг количества срабатываний ассистента"""
+    while self._park_in_progress:
+        # Если достигли лимита срабатываний - останавливаем
+        if self._assist_hit_count >= 15:
+            logging.info(f"Stopping feed assist (hit count: {self._assist_hit_count})")
+            
+            def stop_callback(response):
+                if response.get('code', 0) != 0:
+                    logging.error(f"Failed to stop feed assist: {response.get('msg', 'Unknown error')}")
+                self._park_in_progress = False
+            
+            self.send_request({
+                "method": "stop_feed_assist",
+                "params": {"index": self._park_index}
+            }, stop_callback)
+            return
+        
+        # Проверяем каждые 100мс
+        eventtime = self.reactor.pause(eventtime + 0.1)
+    
+    return eventtime
 
     cmd_ACE_PARK_TO_TOOLHEAD_help = "Park filament to toolhead"
     def cmd_ACE_PARK_TO_TOOLHEAD(self, gcmd):
