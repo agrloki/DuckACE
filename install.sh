@@ -152,7 +152,7 @@ if [ "$UNINSTALL" -ne 1 ]; then
     install_requirements
     link_extension
     copy_config
-    add_updater
+#    add_updater
     restart_moonraker
 else
     uninstall
