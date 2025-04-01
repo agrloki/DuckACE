@@ -7,6 +7,7 @@ import json
 import struct
 import queue
 import traceback
+from typing import Optional, Dict, Any, Callable
 from serial import SerialException
 
 class BunnyAce:
