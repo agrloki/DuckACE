@@ -570,28 +570,57 @@ def _reader_loop(self):
     }, callback)
 
 def _monitor_assist_hits(self, eventtime):
-    """Мониторинг количества срабатываний ассистента"""
+    """Мониторинг количества срабатываний ассистента через запросы статуса"""
+    last_check_time = 0
+    status_request_interval = 0.3  # Интервал запросов статуса (секунды)
+    
     while self._park_in_progress:
-        # Если достигли лимита срабатываний - останавливаем
-        if self._assist_hit_count >= 15:
-            logging.info(f"Stopping feed assist (hit count: {self._assist_hit_count})")
-            
-            def stop_callback(response):
-                if response.get('code', 0) != 0:
-                    logging.error(f"Failed to stop feed assist: {response.get('msg', 'Unknown error')}")
-                self._park_in_progress = False
-            
-            self.send_request({
-                "method": "stop_feed_assist",
-                "params": {"index": self._park_index}
-            }, stop_callback)
-            return
+        current_time = self.reactor.monotonic()
         
-        # Проверяем каждые 100мс
-        eventtime = self.reactor.pause(eventtime + 0.1)
+        # Запрашиваем статус не чаще чем раз в status_request_interval
+        if current_time - last_check_time >= status_request_interval:
+            last_check_time = current_time
+            
+            # Создаем временное хранилище для результата
+            status_result = {'done': False, 'count': 0}
+            
+            # Функция обработки ответа на запрос статуса
+            def status_callback(response):
+                if 'result' in response:
+                    status_result['count'] = response['result'].get('feed_assist_count', 0)
+                status_result['done'] = True
+            
+            # Отправляем запрос статуса
+            self.send_request({
+                "method": "get_status",
+                "id": self._request_id
+            }, status_callback)
+            
+            # Ждем получения ответа (неблокирующее ожидание)
+            while not status_result['done'] and self._park_in_progress:
+                eventtime = self.reactor.pause(eventtime + 0.05)
+            
+            # Проверяем количество срабатываний
+            if status_result['count'] >= 15:
+                logging.info(f"Stopping feed assist (hit count: {status_result['count']})")
+                
+                def stop_callback(response):
+                    if response.get('code', 0) != 0:
+                        logging.error(f"Failed to stop feed assist: {response.get('msg', 'Unknown error')}")
+                    self._park_in_progress = False
+                
+                self.send_request({
+                    "method": "stop_feed_assist",
+                    "params": {"index": self._park_index}
+                }, stop_callback)
+                return
+        
+        # Пауза между проверками
+        eventtime = self.reactor.pause(eventtime + 0.05)
     
     return eventtime
-
+        
+ 
     cmd_ACE_PARK_TO_TOOLHEAD_help = "Park filament to toolhead"
     def cmd_ACE_PARK_TO_TOOLHEAD(self, gcmd):
         """Обработчик команды ACE_PARK_TO_TOOLHEAD"""
