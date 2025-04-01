@@ -358,10 +358,21 @@ class BunnyAce:
         return eventtime + 0.25
 
     def _handle_ready(self):
-        """Обработчик готовности Klipper"""
-        if not self._connect():
-            logging.error("Failed to connect to ACE on startup")
-            return
+ #   """Обработчик готовности Klipper"""
+     if not self._connect():
+        logging.error("Failed to connect to ACE on startup")
+        return
+
+    def info_callback(response):
+        if 'result' in response:
+            info = response['result']
+            self.gcode.respond_info(
+                f"Connected to {info.get('model', 'Unknown')}\n"
+                f"Firmware: {info.get('firmware', 'Unknown')}\n"
+                f"Hardware version: {info.get('hardware', 'Unknown')}"
+            )
+    
+    self.send_request({"method": "get_info"}, info_callback)
 
     def _handle_disconnect(self):
         """Обработчик отключения Klipper"""
@@ -398,21 +409,35 @@ class BunnyAce:
         gcmd.respond_info(f"ACE Status:\n{status}")
 
     cmd_ACE_DEBUG_help = "Debug ACE connection"
-    def cmd_ACE_DEBUG(self, gcmd):
-        """Обработчик команды ACE_DEBUG"""
-        method = gcmd.get('METHOD')
-        params = gcmd.get('PARAMS', '{}')
-        
-        try:
-            def callback(response):
+def cmd_ACE_DEBUG(self, gcmd):
+    """Обработчик команды ACE_DEBUG"""
+    method = gcmd.get('METHOD')
+    params = gcmd.get('PARAMS', '{}')
+    
+    try:
+        def callback(response):
+            # Специальная обработка для get_info
+            if method == "get_info" and 'result' in response:
+                info = response['result']
+                result_str = (
+                    f"Model: {info.get('model', 'Unknown')}\n"
+                    f"Firmware: {info.get('firmware', 'Unknown')}\n"
+                    f"Hardware: {info.get('hardware', 'Unknown')}\n"
+                    f"Serial: {info.get('serial', 'Unknown')}"
+                )
+                gcmd.respond_info(result_str)
+            else:
+                # Стандартный вывод для других методов
                 gcmd.respond_info(json.dumps(response, indent=2))
-            
-            self.send_request({
-                "method": method,
-                "params": json.loads(params)
-            }, callback)
-        except Exception as e:
-            gcmd.respond_error(f"Error: {str(e)}")
+        
+        # Отправляем запрос с обработкой параметров
+        request = {"method": method}
+        if params.strip():
+            request["params"] = json.loads(params)
+        
+        self.send_request(request, callback)
+    except Exception as e:
+        gcmd.respond_error(f"Error: {str(e)}")
 
     cmd_ACE_START_DRYING_help = "Start filament drying"
     def cmd_ACE_START_DRYING(self, gcmd):
