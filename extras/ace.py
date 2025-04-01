@@ -548,78 +548,103 @@ def _reader_loop(self):
     #         "params": {"index": index}
     #     }, callback)
 
-    def _park_to_toolhead(self, index: int):
- #   """Внутренний метод парковки филамента с контролем количества срабатываний ассистента"""
-       def callback(response):
-        if response.get('code', 0) != 0:
-            raise ValueError(f"ACE Error: {response.get('msg', 'Unknown error')}")
+ def _park_to_toolhead(self, index):
+    """Парковка филамента с контролем количества срабатываний ассистента"""
+    def park_callback(self, response):
+        if 'code' in response and response['code'] != 0:
+            raise ValueError("ACE Error: " + response['msg'])
         
-        # Сброс счетчиков и начало процесса парковки
         self._assist_hit_count = 0
         self._last_assist_count = 0
         self._park_in_progress = True
         self._park_index = index
         
-        # Запускаем мониторинг hit count в отдельном потоке
-        self.reactor.register_callback(self._monitor_assist_hits)
+        # Запускаем мониторинг статуса
+        self._start_park_monitoring()
 
-    # Включаем feed assist для указанного слота
-    self.send_request({
-        "method": "start_feed_assist",
-        "params": {"index": index}
-    }, callback)
+    self.send_request(
+        request={"method": "start_feed_assist", "params": {"index": index}},
+        callback=park_callback
+    )
+    self.dwell(delay=0.3)
 
-def _monitor_assist_hits(self, eventtime):
-    """Мониторинг количества срабатываний ассистента через запросы статуса"""
-    last_check_time = 0
-    status_request_interval = 0.3  # Интервал запросов статуса (секунды)
-    
-    while self._park_in_progress:
-        current_time = self.reactor.monotonic()
+def _start_park_monitoring(self):
+    """Запуск мониторинга процесса парковки"""
+    def status_callback(self, response):
+        if not self._park_in_progress:
+            return
+            
+        if 'result' not in response:
+            return
+            
+        # Обновляем информацию о состоянии
+        self._info = response['result']
         
-        # Запрашиваем статус не чаще чем раз в status_request_interval
-        if current_time - last_check_time >= status_request_interval:
-            last_check_time = current_time
+        # Проверяем завершение парковки
+        if self._info['status'] == 'ready':
+            new_assist_count = self._info.get('feed_assist_count', 0)
             
-            # Создаем временное хранилище для результата
-            status_result = {'done': False, 'count': 0}
-            
-            # Функция обработки ответа на запрос статуса
-            def status_callback(response):
-                if 'result' in response:
-                    status_result['count'] = response['result'].get('feed_assist_count', 0)
-                status_result['done'] = True
-            
-            # Отправляем запрос статуса
-            self.send_request({
-                "method": "get_status",
-                "id": self._request_id
-            }, status_callback)
-            
-            # Ждем получения ответа (неблокирующее ожидание)
-            while not status_result['done'] and self._park_in_progress:
-                eventtime = self.reactor.pause(eventtime + 0.05)
-            
-            # Проверяем количество срабатываний
-            if status_result['count'] >= 1:
-                logging.info(f"Stopping feed assist (hit count: {status_result['count']})")
+            if new_assist_count > self._last_assist_count:
+                self._last_assist_count = new_assist_count
+                self._assist_hit_count = 0
+                self.dwell(0.7, True)
+            else:
+                self._assist_hit_count += 1
+                self.dwell(0.7, True)
                 
-                def stop_callback(response):
-                    if response.get('code', 0) != 0:
-                        logging.error(f"Failed to stop feed assist: {response.get('msg', 'Unknown error')}")
-                    self._park_in_progress = False
-                
-                self.send_request({
+                # Проверяем достижение лимита
+                if self._assist_hit_count >= 15:
+                    self._complete_parking()
+
+    # Регистрируем callback для мониторинга
+    self._park_monitor_callback = status_callback
+    self._request_status_loop()
+
+def _request_status_loop(self):
+    """Цикл запросов статуса для мониторинга парковки"""
+    if not self._park_in_progress:
+        return
+        
+    self.send_request(
+        request={"method": "get_status"},
+        callback=self._park_monitor_callback
+    )
+    
+    # Планируем следующий запрос через 0.3 секунды
+    self.reactor.register_timer(
+        lambda eventtime: self._request_status_loop(),
+        self.reactor.monotonic() + 0.3
+    )
+
+def _complete_parking(self):
+    """Завершение процесса парковки"""
+    self._park_in_progress = False
+    logging.info('ACE: Parked to toolhead with assist count: ' + 
+                str(self._last_assist_count))
+
+    # Останавливаем feed assist
+    def stop_callback(self, response):
+        if 'code' in response and response['code'] != 0:
+            logging.error("ACE Error: " + response.get('msg', 'Unknown error'))
+        
+        # Обработка завершения смены инструмента
+        if self._park_is_toolchange:
+            self._park_is_toolchange = False
+            self.gcode.run_script_from_command(
+                '_ACE_POST_TOOLCHANGE FROM=' + 
+                str(self._park_previous_tool) + 
+                ' TO=' + str(self._park_index)
+            )
+            if self.disable_assist_after_toolchange:
+                self._send_request({
                     "method": "stop_feed_assist",
                     "params": {"index": self._park_index}
-                }, stop_callback)
-                return
-        
-        # Пауза между проверками
-        eventtime = self.reactor.pause(eventtime + 0.05)
-    
-    return eventtime
-        
+                })
+
+    self.send_request(
+        request={"method": "stop_feed_assist", "params": {"index": self._park_index}},
+        callback=stop_callback
+    )        
  
     cmd_ACE_PARK_TO_TOOLHEAD_help = "Park filament to toolhead"
     def cmd_ACE_PARK_TO_TOOLHEAD(self, gcmd):
