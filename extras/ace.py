@@ -252,39 +252,116 @@ class BunnyAce:
             data ^= (data & 0x0f) << 4
             crc = ((data << 8) | (crc >> 8)) ^ (data >> 4) ^ (data << 3)
         return crc
-
-    def _reader_loop(self):
-        """Цикл чтения данных от устройства"""
-        while self._connected:
-            try:
-                ret = self._serial.read_until(expected=bytes([0xFE]), size=4096)
-                if not ret:
-                    continue
-
-                if not (ret[0] == 0xFF and ret[1] == 0xAA and ret[-1] == 0xFE):
-                    logging.warning(f'Invalid data received: {ret.hex()}')
+    
+def _reader_loop(self):
+    """Цикл чтения данных от устройства"""
+    buffer = bytearray()
+    terminator = bytes([0xFE])
+    header = bytes([0xFF, 0xAA])
+    
+    while self._connected:
+        try:
+            # Чтение доступных данных
+            data = self._serial.read(4096)
+            if not data:
+                time.sleep(0.01)
+                continue
+            
+            buffer.extend(data)
+            
+            # Поиск пакетов в буфере
+            while True:
+                # Ищем заголовок пакета
+                start_idx = buffer.find(header)
+                if start_idx < 0:
+                    # Нет полного заголовка, оставляем в буфере последние 1 байт
+                    if len(buffer) > 1:
+                        buffer = buffer[-1:]
+                    break
+                
+                # Удаляем мусор перед заголовком
+                if start_idx > 0:
+                    logging.warning(f"Dropping {start_idx} bytes before header: {buffer[:start_idx].hex()}")
+                    buffer = buffer[start_idx:]
+                
+                # Проверяем, что есть достаточно данных для заголовка
+                if len(buffer) < 4:
+                    break  # Ждем больше данных
+                
+                # Получаем длину полезной нагрузки
+                payload_len = struct.unpack('<H', buffer[2:4])[0]
+                total_packet_len = 4 + payload_len + 2 + 1  # заголовок + данные + CRC + терминатор
+                
+                # Проверяем, есть ли полный пакет
+                if len(buffer) < total_packet_len:
+                    break  # Ждем больше данных
+                
+                # Проверяем терминатор
+                if buffer[total_packet_len-1:total_packet_len] != terminator:
+                    logging.warning(f"Invalid terminator, dropping packet: {buffer[:total_packet_len].hex()}")
+                    buffer = buffer[total_packet_len:]
                     continue
                 
-                rlen = struct.unpack('<H', ret[2:4])[0]
-                payload = ret[4:4+rlen]
-                crc_data = ret[4+rlen:4+rlen+2]
+                # Извлекаем полный пакет
+                packet = buffer[:total_packet_len]
+                buffer = buffer[total_packet_len:]
+                
+                # Проверяем CRC
+                payload = packet[4:4+payload_len]
+                crc_data = packet[4+payload_len:4+payload_len+2]
                 
                 if self._calc_crc(payload) != struct.unpack('<H', crc_data)[0]:
-                    logging.warning(f'CRC mismatch in packet: {ret.hex()}')
+                    logging.warning(f'CRC mismatch in packet: {packet.hex()}')
                     continue
+                
+                try:
+                    response = json.loads(payload.decode('utf-8'))
+                    if 'id' in response and response['id'] in self._callback_map:
+                        callback = self._callback_map.pop(response['id'])
+                        callback(response)
+                except Exception as e:
+                    logging.error(f"Error processing packet: {e}\nPacket: {packet.hex()}")
 
-                response = json.loads(payload.decode('utf-8'))
-                if 'id' in response and response['id'] in self._callback_map:
-                    callback = self._callback_map.pop(response['id'])
-                    callback(response)
+        except SerialException:
+            logging.error("Serial communication error")
+            self.printer.invoke_shutdown("Lost communication with ACE")
+            break
+        except Exception as e:
+            logging.error(f"Reader error: {traceback.format_exc()}")
+            time.sleep(0.1)
+            
+    # def _reader_loop(self):
+    #     """Цикл чтения данных от устройства"""
+    #     while self._connected:
+    #         try:
+    #             ret = self._serial.read_until(expected=bytes([0xFE]), size=4096)
+    #             if not ret:
+    #                 continue
 
-            except SerialException:
-                logging.error("Serial communication error")
-                self.printer.invoke_shutdown("Lost communication with ACE")
-                break
-            except Exception as e:
-                logging.error(f"Reader error: {traceback.format_exc()}")
-                time.sleep(0.1)
+    #             if not (ret[0] == 0xFF and ret[1] == 0xAA and ret[-1] == 0xFE):
+    #                 logging.warning(f'Invalid data received: {ret.hex()}')
+    #                 continue
+                
+    #             rlen = struct.unpack('<H', ret[2:4])[0]
+    #             payload = ret[4:4+rlen]
+    #             crc_data = ret[4+rlen:4+rlen+2]
+                
+    #             if self._calc_crc(payload) != struct.unpack('<H', crc_data)[0]:
+    #                 logging.warning(f'CRC mismatch in packet: {ret.hex()}')
+    #                 continue
+
+    #             response = json.loads(payload.decode('utf-8'))
+    #             if 'id' in response and response['id'] in self._callback_map:
+    #                 callback = self._callback_map.pop(response['id'])
+    #                 callback(response)
+
+    #         except SerialException:
+    #             logging.error("Serial communication error")
+    #             self.printer.invoke_shutdown("Lost communication with ACE")
+    #             break
+    #         except Exception as e:
+    #             logging.error(f"Reader error: {traceback.format_exc()}")
+    #             time.sleep(0.1)
 
     def _writer_loop(self):
         """Цикл отправки данных на устройство"""
