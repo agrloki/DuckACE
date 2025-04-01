@@ -374,21 +374,59 @@ def _reader_loop(self):
                         self._callback_map[request['id']] = callback
                         self._send_request(request)
                 else:
-                    # Периодический запрос статуса
-                    def status_callback(response):
-                        if 'result' in response:
-                            self._info = response['result']
+                    def callback(self, response):
+                     if response is not None:
+                        self._info = response['result']
+                        # logging.info('ACE: Update status ' + str(self._request_id))
+                        
+                        if self._park_in_progress and self._info['status'] == 'ready':
+                            new_assist_count = self._info['feed_assist_count']
+                            if new_assist_count > self._last_assist_count:
+                                self._last_assist_count = new_assist_count
+                                self.dwell(0.7, True) # 0.68 + small room 0.02 for response
+                                self._assist_hit_count = 0
+                            elif self._assist_hit_count < self.park_hit_count:
+                                self._assist_hit_count += 1
+                                self.dwell(0.7, True)
+                            else:
+                                self._assist_hit_count = 0
+                                self._park_in_progress = False
+                                logging.info('ACE: Parked to toolhead with assist count: ' + str(self._last_assist_count))
+
+                                if self._park_is_toolchange:
+                                    self._park_is_toolchange = False
+                                    def main_callback():
+                                        self.gcode.run_script_from_command('_ACE_POST_TOOLCHANGE FROM=' + str(self._park_previous_tool) + ' TO=' + str(self._park_index))
+                                    self._main_queue.put(main_callback)
+                                    if self.disable_assist_after_toolchange:
+                                        self._send_request({"method": "stop_feed_assist", "params": {"index": self._park_index}})
+                                else:
+                                    self._send_request({"method": "stop_feed_assist", "params": {"index": self._park_index}})
+
+                id = self._request_id
+                self._request_id += 1
+                self._callback_map[id] = callback
+
+                self._send_request({"id": id, "method": "get_status"})
+                if self._park_in_progress:
+                    time.sleep(0.68)
+                else:
+                    time.sleep(0.25)
+                    # # Периодический запрос статуса
+                    # def status_callback(response):
+                    #     if 'result' in response:
+                    #         self._info = response['result']
                     
-                    self.send_request({
-                        "id": self._request_id,
-                        "method": "get_status"
-                    }, status_callback)
+                    # self.send_request({
+                    #     "id": self._request_id,
+                    #     "method": "get_status"
+                    # }, status_callback)
                     
-                    # Обработка парковки
-                    if self._park_in_progress:
-                        time.sleep(0.68)
-                    else:
-                        time.sleep(0.25)
+                    # # Обработка парковки
+                    # if self._park_in_progress:
+                    #     time.sleep(0.68)
+                    # else:
+                    #     time.sleep(0.25)
 
             except SerialException:
                 logging.error("Serial communication error")
