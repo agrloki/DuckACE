@@ -418,10 +418,21 @@ class BunnyAce:
         logging.error("Failed to connect to ACE on startup")
         return
 
-        def info_callback(self, response):
-            res = response['result']
-            self.gcode.respond_info('Connected ' + res['model'] + ' ' + res['firmware'])
-        self.send_request(request = {"method": "get_info"}, callback = info_callback)
+    def info_callback(self, response):
+        try:
+            res = response.get('result', {})
+            model = res.get('model', 'Unknown')
+            firmware = res.get('firmware', 'Unknown')
+            self.gcode.respond_info(f'Connected {model} {firmware}')
+        
+        # Дополнительные действия после получения информации
+        # (без повторного запроса get_info!)
+        except Exception as e:
+            logging.error(f"Error processing device info: {str(e)}")
+            self.gcode.respond_error("Failed to get device info")
+
+        # Первый запрос при подключении
+        self.send_request(request={"method": "get_info"}, callback=self.info_callback)
  
     def _handle_disconnect(self):
         """Обработчик отключения Klipper"""
