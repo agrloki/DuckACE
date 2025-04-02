@@ -21,9 +21,6 @@ class BunnyAce:
             self._name = self._name[4:]
         
         self.variables = self.printer.lookup_object('save_variables').allVariables
-        self.lock = False
-        self.read_buffer = bytearray()
-        self.send_time = 0
 
         # Автопоиск устройства
         default_serial = self._find_ace_device()
@@ -66,7 +63,7 @@ class BunnyAce:
     def _find_ace_device(self) -> Optional[str]:
         """Поиск устройства ACE по VID/PID или описанию"""
         ACE_IDS = {
-            'VID:PID': [(0x0483, 0x5740)],
+            'VID:PID': [(0x0483, 0x5740)],  # Пример для STM32
             'DESCRIPTION': ['ACE', 'BunnyAce', 'DuckAce']
         }
         
@@ -145,21 +142,16 @@ class BunnyAce:
                     self._info['status'] = 'ready'
                     logging.info(f"Connected to ACE at {self.serial_name}")
                     
-                    # Запускаем потоки только если они еще не запущены
-                    if not hasattr(self, '_writer_thread') or not self._writer_thread.is_alive():
-                        self._writer_thread = threading.Thread(target=self._writer_loop)
-                        self._writer_thread.daemon = True
-                        self._writer_thread.start()
+                    self._writer_thread = threading.Thread(target=self._writer_loop)
+                    self._writer_thread.daemon = True
+                    self._writer_thread.start()
 
-                    if not hasattr(self, '_reader_thread') or not self._reader_thread.is_alive():
-                        self._reader_thread = threading.Thread(target=self._reader_loop)
-                        self._reader_thread.daemon = True
-                        self._reader_thread.start()
+                    self._reader_thread = threading.Thread(target=self._reader_loop)
+                    self._reader_thread.daemon = True
+                    self._reader_thread.start()
 
-                    if not hasattr(self, 'main_timer'):
-                        self.main_timer = self.reactor.register_timer(self._main_eval, self.reactor.NOW)
+                    self.main_timer = self.reactor.register_timer(self._main_eval, self.reactor.NOW)
                     
-                    # Запрос информации об устройстве
                     def info_callback(response):
                         res = response['result']
                         self.gcode.respond_info(f"Connected {res.get('model', 'Unknown')} {res.get('firmware', 'Unknown')}")
@@ -175,71 +167,36 @@ class BunnyAce:
         return False
 
     def _reconnect(self) -> bool:
-        """Безопасное переподключение"""
-        if not self._connected:
-            return self._connect()
+        """Переподключение при потере связи"""
+        if self._connected:
+            self._disconnect()
         
-        try:
-            # Сохраняем ссылки на старые потоки
-            old_writer = getattr(self, '_writer_thread', None)
-            old_reader = getattr(self, '_reader_thread', None)
-            
-            # Сбрасываем флаги перед новым подключением
-            self._connected = False
-            
-            # Пытаемся подключиться
-            if self._connect():
-                # Аккуратно завершаем старые потоки
-                if old_writer and old_writer.is_alive() and old_writer != threading.current_thread():
-                    try:
-                        old_writer.join(timeout=0.5)
-                    except:
-                        pass
-                
-                if old_reader and old_reader.is_alive() and old_reader != threading.current_thread():
-                    try:
-                        old_reader.join(timeout=0.5)
-                    except:
-                        pass
-                
-                return True
-            return False
-        except Exception as e:
-            logging.error(f"Reconnect error: {str(e)}")
-            return False
+        logging.info("Attempting to reconnect...")
+        if self._connect():
+            self._info = self._get_default_info()
+            self._info['status'] = 'ready'
+            return True
+        return False
 
     def _disconnect(self):
-        """Безопасное отключение"""
+        """Корректное отключение устройства"""
         if not self._connected:
             return
-        
+            
+        logging.info("Disconnecting from ACE...")
         self._connected = False
         
-        try:
-            if hasattr(self, '_serial'):
-                self._serial.close()
-        except:
-            pass
+        if hasattr(self, '_writer_thread'):
+            self._writer_thread.join(timeout=1)
         
-        # Не пытаемся завершить потоки из самих потоков
-        current_thread = threading.current_thread()
-        if hasattr(self, '_writer_thread') and self._writer_thread != current_thread:
-            try:
-                self._writer_thread.join(timeout=1)
-            except:
-                pass
+        if hasattr(self, '_reader_thread'):
+            self._reader_thread.join(timeout=1)
         
-        if hasattr(self, '_reader_thread') and self._reader_thread != current_thread:
-            try:
-                self._reader_thread.join(timeout=1)
-            except:
-                pass
+        if hasattr(self, '_serial'):
+            self._serial.close()
         
         if hasattr(self, 'main_timer'):
-            try:
-                self.reactor.unregister_timer(self.main_timer)
-            except:
-                pass
+            self.reactor.unregister_timer(self.main_timer)
 
     def _send_request(self, request: Dict[str, Any]) -> bool:
         """Отправка запроса с CRC проверкой"""
@@ -263,13 +220,8 @@ class BunnyAce:
             bytes([0xFE]))
         
         try:
-            if not hasattr(self, '_serial') or not self._serial.is_open:
-                if not self._reconnect():
-                    return False
-            
             self._serial.write(packet)
             self.send_time = time.time()
-            self.lock = True
             return True
         except SerialException:
             logging.error("Write error, attempting reconnect")
@@ -285,17 +237,6 @@ class BunnyAce:
             data ^= (data & 0x0f) << 4
             crc = ((data << 8) | (crc >> 8)) ^ (data >> 4) ^ (data << 3)
         return crc
-
-    def _reader_loop(self):
-        """Основной цикл чтения"""
-        while getattr(self, '_connected', False):
-            try:
-                eventtime = self.reactor.monotonic()
-                next_eventtime = self._reader(eventtime)
-                time.sleep(max(0, next_eventtime - self.reactor.monotonic()))
-            except Exception as e:
-                logging.error(f"Reader loop error: {str(e)}")
-                time.sleep(1)
 
     def _reader(self, eventtime):
         buffer = bytearray()
@@ -369,7 +310,8 @@ class BunnyAce:
 
             if 'id' in response and response['id'] in self._callback_map:
                 callback = self._callback_map.pop(response['id'])
-                callback(self, response)
+                # Правильный вызов callback с self и response
+                callback(self, response)  # <-- Вот ключевое исправление!
 
         except json.JSONDecodeError:
             self.gcode.respond_info("Invalid JSON from ACE PRO")
@@ -408,37 +350,39 @@ class BunnyAce:
         }, stop_callback)
 
     def _writer_loop(self):
-        """Безопасный цикл записи"""
-        while getattr(self, '_connected', False):
+        """Цикл отправки данных на устройство"""
+        while self._connected:
             try:
                 if not self._queue.empty():
                     task = self._queue.get_nowait()
                     if task:
                         request, callback = task
                         self._callback_map[request['id']] = callback
-                        if not self._send_request(request):
-                            continue
-                
-                # Периодический запрос статуса
-                def status_callback(response):
-                    if 'result' in response:
-                        self._info = response['result']
-                
-                self.send_request({
-                    "id": self._request_id,
-                    "method": "get_status"
-                }, status_callback)
-                
-                # Безопасная задержка
-                time.sleep(0.25 if not self._park_in_progress else 0.68)
+                        self._send_request(request)
+                else:
+                    # Периодический запрос статуса
+                    def status_callback(response):
+                        if 'result' in response:
+                            self._info = response['result']
+                    
+                    self.send_request({
+                        "id": self._request_id,
+                        "method": "get_status"
+                    }, status_callback)
+                    
+                    # Обработка парковки
+                    if self._park_in_progress:
+                        time.sleep(0.68)
+                    else:
+                        time.sleep(0.25)
 
             except SerialException:
-                logging.error("Serial write error")
-                if self._connected:
-                    self._reconnect()
+                logging.error("Serial communication error")
+                self.printer.invoke_shutdown("Lost communication with ACE")
+                break
             except Exception as e:
-                logging.error(f"Writer loop error: {str(e)}")
-                time.sleep(1)
+                logging.error(f"Writer error: {traceback.format_exc()}")
+                time.sleep(0.1)
 
     def _main_eval(self, eventtime):
         """Обработка задач в основном потоке"""
@@ -449,11 +393,27 @@ class BunnyAce:
         return eventtime + 0.25
 
     def _handle_ready(self):
-        """Обработчик готовности Klipper"""
-        if not self._connect():
-            logging.error("Failed to connect to ACE on startup")
-            return
+ #   """Обработчик готовности Klipper"""
+     if not self._connect():
+        logging.error("Failed to connect to ACE on startup")
+        return
 
+    def info_callback(self, response):
+        try:
+            res = response.get('result', {})
+            model = res.get('model', 'Unknown')
+            firmware = res.get('firmware', 'Unknown')
+            self.gcode.respond_info(f'Connected {model} {firmware}')
+        
+        # Дополнительные действия после получения информации
+        # (без повторного запроса get_info!)
+        except Exception as e:
+            logging.error(f"Error processing device info: {str(e)}")
+            self.gcode.respond_error("Failed to get device info")
+
+        # Первый запрос при подключении
+        self.send_request(request={"method": "get_info"}, callback=self.info_callback)
+ 
     def _handle_disconnect(self):
         """Обработчик отключения Klipper"""
         self._disconnect()
@@ -490,34 +450,47 @@ class BunnyAce:
 
     cmd_ACE_DEBUG_help = "Debug ACE connection"
     def cmd_ACE_DEBUG(self, gcmd):
-        """Обработчик команды ACE_DEBUG"""
         method = gcmd.get('METHOD')
         params = gcmd.get('PARAMS', '{}')
-        
+
         try:
-            def callback(response):
-                # Специальная обработка для get_info
-                if method == "get_info" and 'result' in response:
-                    info = response['result']
-                    result_str = (
-                        f"Model: {info.get('model', 'Unknown')}\n"
-                        f"Firmware: {info.get('firmware', 'Unknown')}\n"
-                        f"Hardware: {info.get('hardware', 'Unknown')}\n"
-                        f"Serial: {info.get('serial', 'Unknown')}"
-                    )
-                    gcmd.respond_info(result_str)
-                else:
-                    # Стандартный вывод для других методов
-                    gcmd.respond_info(json.dumps(response, indent=2))
-            
-            # Отправляем запрос с обработкой параметров
-            request = {"method": method}
-            if params.strip():
-                request["params"] = json.loads(params)
-            
-            self.send_request(request, callback)
+            def callback(self, response):
+                self.gcode.respond_info(str(response))
+
+            self.send_request(request = {"method": method, "params": json.loads(params)}, callback = callback)
         except Exception as e:
-            gcmd.respond_error(f"Error: {str(e)}")
+            self.gcode.respond_info('Error: ' + str(e))
+
+
+# def cmd_ACE_DEBUG(self, gcmd):
+#     """Обработчик команды ACE_DEBUG"""
+#     method = gcmd.get('METHOD')
+#     params = gcmd.get('PARAMS', '{}')
+    
+#     try:
+#         def callback(response):
+#             # Специальная обработка для get_info
+#             if method == "get_info" and 'result' in response:
+#                 info = response['result']
+#                 result_str = (
+#                     f"Model: {info.get('model', 'Unknown')}\n"
+#                     f"Firmware: {info.get('firmware', 'Unknown')}\n"
+#                     f"Hardware: {info.get('hardware', 'Unknown')}\n"
+#                     f"Serial: {info.get('serial', 'Unknown')}"
+#                 )
+#                 gcmd.respond_info(result_str)
+#             else:
+#                 # Стандартный вывод для других методов
+#                 gcmd.respond_info(json.dumps(response, indent=2))
+        
+#         # Отправляем запрос с обработкой параметров
+#         request = {"method": method}
+#         if params.strip():
+#             request["params"] = json.loads(params)
+        
+#         self.send_request(request, callback)
+#     except Exception as e:
+#         gcmd.respond_error(f"Error: {str(e)}")
 
     cmd_ACE_START_DRYING_help = "Start filament drying"
     def cmd_ACE_START_DRYING(self, gcmd):
