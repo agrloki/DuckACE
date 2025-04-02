@@ -268,6 +268,7 @@ class BunnyAce:
                 self.gcode.respond_info("Unable to communicate with the ACE PRO" + traceback.format_exc())
                 self.lock = False
                 return eventtime + 0.5
+
             if len(raw_bytes):
                 text_buffer = self.read_buffer + raw_bytes
                 i = text_buffer.find(b'\xfe')
@@ -294,9 +295,7 @@ class BunnyAce:
             return eventtime + 0.1
 
         payload_len = struct.unpack('<H', buffer[2:4])[0]
-
         payload = buffer[4:4 + payload_len]
-
         crc_data = buffer[4 + payload_len:4 + payload_len + 2]
         crc = struct.pack('@H', self._calc_crc(payload))
 
@@ -306,41 +305,43 @@ class BunnyAce:
             self.gcode.respond_info(str(buffer))
             return eventtime + 0.1
 
-
-
         if crc_data != crc:
             self.lock = False
             self.gcode.respond_info('Invalid data from ACE PRO (CRC)')
+            return eventtime + 0.1
 
-        response = json.loads(payload.decode('utf-8'))
+        try:
+            response = json.loads(payload.decode('utf-8'))
 
-                # Обработка парковки филамента
-        if self._park_in_progress and 'result' in response:
-                    self._info = response['result']
-                    if self._info['status'] == 'ready':
-                        new_assist_count = self._info.get('feed_assist_count', 0)
-                        
-                        if new_assist_count > self._last_assist_count:
-                            self._last_assist_count = new_assist_count
-                            self._assist_hit_count = 0
-                            self.dwell(0.7, True)
-                        elif self._assist_hit_count < self.park_hit_count:
-                            self._assist_hit_count += 1
-                            self.dwell(0.7, True)
-                        else:
-                            self._complete_parking()
+            # Обработка парковки филамента
+            if self._park_in_progress and 'result' in response:
+                self._info = response['result']
+                if self._info['status'] == 'ready':
+                    new_assist_count = self._info.get('feed_assist_count', 0)
 
-        if 'id' in response and response['id'] in self._callback_map:
-                    callback = self._callback_map.pop(response['id'])
-                    callback(response)
+                    if new_assist_count > self._last_assist_count:
+                        self._last_assist_count = new_assist_count
+                        self._assist_hit_count = 0
+                        self.dwell(0.7, True)
+                    elif self._assist_hit_count < self.park_hit_count:
+                        self._assist_hit_count += 1
+                        self.dwell(0.7, True)
+                    else:
+                        self._complete_parking()
 
-        # except SerialException:
-        #               logging.error("Serial communication error")
-        #               self.printer.invoke_shutdown("Lost communication with ACE")
-        # break
-        #     except Exception as e:
-        #         logging.error(f"Reader error: {traceback.format_exc()}")
-        #         time.sleep(0.1)
+            if 'id' in response and response['id'] in self._callback_map:
+                callback = self._callback_map.pop(response['id'])
+                # Правильный вызов callback с self и response
+                callback(self, response)  # <-- Вот ключевое исправление!
+
+        except json.JSONDecodeError:
+            self.gcode.respond_info("Invalid JSON from ACE PRO")
+            return eventtime + 0.1
+        except Exception as e:
+            self.gcode.respond_info(f"Error processing response: {str(e)}")
+            return eventtime + 0.1
+
+        return eventtime + 0.1
 
     def _complete_parking(self):
         """Завершение процесса парковки"""
