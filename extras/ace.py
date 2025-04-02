@@ -238,30 +238,84 @@ class BunnyAce:
             crc = ((data << 8) | (crc >> 8)) ^ (data >> 4) ^ (data << 3)
         return crc
 
-    def _reader_loop(self):
-        """Цикл чтения данных от устройства"""
-        while self._connected:
+    # def _reader_loop(self):
+    #     """Цикл чтения данных от устройства"""
+    #     while self._connected:
+    #         try:
+    #             ret = self._serial.read_until(expected=bytes([0xFE]), size=4096)
+    #             if not ret:
+    #                 continue
+
+    #             if not (ret[0] == 0xFF and ret[1] == 0xAA and ret[-1] == 0xFE):
+    #                 logging.warning(f'Invalid data received: {ret.hex()}')
+    #                 continue
+                
+    #             rlen = struct.unpack('<H', ret[2:4])[0]
+    #             payload = ret[4:4+rlen]
+    #             crc_data = ret[4+rlen:4+rlen+2]
+                
+    #             if self._calc_crc(payload) != struct.unpack('<H', crc_data)[0]:
+    #                 logging.warning(f'CRC mismatch in packet: {ret.hex()}')
+    #                 continue
+
+    #             response = json.loads(payload.decode('utf-8'))
+    def _reader(self, eventtime):
+        buffer = bytearray()
+        while True:
             try:
-                ret = self._serial.read_until(expected=bytes([0xFE]), size=4096)
-                if not ret:
-                    continue
+                raw_bytes = self._serial.read(size=4096)
+            except SerialException:
+                self.gcode.respond_info("Unable to communicate with the ACE PRO" + traceback.format_exc())
+                self.lock = False
+                return eventtime + 0.5
+            if len(raw_bytes):
+                text_buffer = self.read_buffer + raw_bytes
+                i = text_buffer.find(b'\xfe')
+                if i >= 0:
+                    buffer = text_buffer
+                    self.read_buffer = bytearray()
+                else:
+                    self.read_buffer += raw_bytes
+            else:
+                break
 
-                if not (ret[0] == 0xFF and ret[1] == 0xAA and ret[-1] == 0xFE):
-                    logging.warning(f'Invalid data received: {ret.hex()}')
-                    continue
-                
-                rlen = struct.unpack('<H', ret[2:4])[0]
-                payload = ret[4:4+rlen]
-                crc_data = ret[4+rlen:4+rlen+2]
-                
-                if self._calc_crc(payload) != struct.unpack('<H', crc_data)[0]:
-                    logging.warning(f'CRC mismatch in packet: {ret.hex()}')
-                    continue
+        if self.lock and (self.reactor.monotonic() - self.send_time) > 2:
+            self.lock = False
+            self.gcode.respond_info(f"timeout {self.reactor.monotonic()}")
+            return eventtime + 0.1
 
-                response = json.loads(payload.decode('utf-8'))
-                
+        if len(buffer) < 7:
+            return eventtime + 0.1
+
+        if buffer[0:2] != bytes([0xFF, 0xAA]):
+            self.lock = False
+            self.gcode.respond_info("Invalid data from ACE PRO (head bytes)")
+            self.gcode.respond_info(str(buffer))
+            return eventtime + 0.1
+
+        payload_len = struct.unpack('<H', buffer[2:4])[0]
+
+        payload = buffer[4:4 + payload_len]
+
+        crc_data = buffer[4 + payload_len:4 + payload_len + 2]
+        crc = struct.pack('@H', self._calc_crc(payload))
+
+        if len(buffer) < (4 + payload_len + 2 + 1):
+            self.lock = False
+            self.gcode.respond_info(f"Invalid data from ACE PRO (len) {payload_len} {len(buffer)} {crc}")
+            self.gcode.respond_info(str(buffer))
+            return eventtime + 0.1
+
+
+
+        if crc_data != crc:
+            self.lock = False
+            self.gcode.respond_info('Invalid data from ACE PRO (CRC)')
+
+        response = json.loads(payload.decode('utf-8'))
+
                 # Обработка парковки филамента
-                if self._park_in_progress and 'result' in response:
+        if self._park_in_progress and 'result' in response:
                     self._info = response['result']
                     if self._info['status'] == 'ready':
                         new_assist_count = self._info.get('feed_assist_count', 0)
@@ -276,17 +330,17 @@ class BunnyAce:
                         else:
                             self._complete_parking()
 
-                if 'id' in response and response['id'] in self._callback_map:
+        if 'id' in response and response['id'] in self._callback_map:
                     callback = self._callback_map.pop(response['id'])
                     callback(response)
 
-            except SerialException:
-                logging.error("Serial communication error")
-                self.printer.invoke_shutdown("Lost communication with ACE")
-                break
-            except Exception as e:
-                logging.error(f"Reader error: {traceback.format_exc()}")
-                time.sleep(0.1)
+        # except SerialException:
+        #               logging.error("Serial communication error")
+        #               self.printer.invoke_shutdown("Lost communication with ACE")
+        # break
+        #     except Exception as e:
+        #         logging.error(f"Reader error: {traceback.format_exc()}")
+        #         time.sleep(0.1)
 
     def _complete_parking(self):
         """Завершение процесса парковки"""
