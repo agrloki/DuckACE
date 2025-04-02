@@ -367,9 +367,13 @@ class BunnyAce:
                     else:
                         self._complete_parking()
 
+            # Вызываем callback с ответом
             if 'id' in response and response['id'] in self._callback_map:
                 callback = self._callback_map.pop(response['id'])
-                callback(self, response)
+                try:
+                    callback(response)  # Передаем только response
+                except Exception as e:
+                    logging.error(f"Callback error: {str(e)}")
 
         except json.JSONDecodeError:
             self.gcode.respond_info("Invalid JSON from ACE PRO")
@@ -494,28 +498,61 @@ class BunnyAce:
         method = gcmd.get('METHOD')
         params = gcmd.get('PARAMS', '{}')
         
+        # Создаем event для ожидания ответа
+        response_event = threading.Event()
+        response_data = [None]
+
+        def callback(response):  # Теперь принимает только response
+            response_data[0] = response
+            response_event.set()
+
         try:
-            def callback(response):
-                # Специальная обработка для get_info
-                if method == "get_info" and 'result' in response:
-                    info = response['result']
-                    result_str = (
-                        f"Model: {info.get('model', 'Unknown')}\n"
-                        f"Firmware: {info.get('firmware', 'Unknown')}\n"
-                        f"Hardware: {info.get('hardware', 'Unknown')}\n"
-                        f"Serial: {info.get('serial', 'Unknown')}"
-                    )
-                    gcmd.respond_info(result_str)
-                else:
-                    # Стандартный вывод для других методов
-                    gcmd.respond_info(json.dumps(response, indent=2))
-            
-            # Отправляем запрос с обработкой параметров
             request = {"method": method}
             if params.strip():
-                request["params"] = json.loads(params)
-            
+                try:
+                    request["params"] = json.loads(params)
+                except json.JSONDecodeError:
+                    gcmd.respond_error("Invalid PARAMS format")
+                    return
+
             self.send_request(request, callback)
+
+            if not response_event.wait(5.0):
+                gcmd.respond_error("Timeout waiting for response")
+                return
+
+            response = response_data[0]
+            if response is None:
+                gcmd.respond_error("No response received")
+                return
+
+            if method in ["get_info", "get_status"] and 'result' in response:
+                result = response['result']
+                output = []
+                
+                if method == "get_info":
+                    output.append("=== Device Info ===")
+                    output.append(f"Model: {result.get('model', 'Unknown')}")
+                    output.append(f"Firmware: {result.get('firmware', 'Unknown')}")
+                    output.append(f"Hardware: {result.get('hardware', 'Unknown')}")
+                    output.append(f"Serial: {result.get('serial', 'Unknown')}")
+                else:
+                    output.append("=== Status ===")
+                    output.append(f"State: {result.get('status', 'Unknown')}")
+                    output.append(f"Temperature: {result.get('temp', 'Unknown')}")
+                    output.append(f"Fan Speed: {result.get('fan_speed', 'Unknown')}")
+                    
+                    # Добавляем информацию о слотах
+                    for slot in result.get('slots', []):
+                        output.append(f"\nSlot {slot.get('index', '?')}:")
+                        output.append(f"  Status: {slot.get('status', 'Unknown')}")
+                        output.append(f"  Type: {slot.get('type', 'Unknown')}")
+                        output.append(f"  Color: {slot.get('color', 'Unknown')}")
+                
+                gcmd.respond_info("\n".join(output))
+            else:
+                gcmd.respond_info(json.dumps(response, indent=2))
+
         except Exception as e:
             gcmd.respond_error(f"Error: {str(e)}")
 
