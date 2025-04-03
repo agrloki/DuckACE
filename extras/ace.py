@@ -24,8 +24,6 @@ class BunnyAce:
         self.lock = False
         self.read_buffer = bytearray()
         self.send_time = 0
-        self._info_lock = threading.Lock()
-        self._command_lock = threading.Lock()
 
         # Автопоиск устройства
         default_serial = self._find_ace_device()
@@ -47,8 +45,15 @@ class BunnyAce:
         self._connected = False
         self._connection_attempts = 0
         self._max_connection_attempts = 5
-        self._last_read_time = 0
-        self._last_comm_time = 0
+        
+        # Параметры работы
+        self._feed_assist_index = -1
+        self._last_assist_count = 0
+        self._assist_hit_count = 0
+        self._park_in_progress = False
+        self._park_is_toolchange = False
+        self._park_previous_tool = -1
+        self._park_index = -1
         
         # Очереди и потоки
         self._queue = queue.Queue()
@@ -133,21 +138,15 @@ class BunnyAce:
                 self._serial = serial.Serial(
                     port=self.serial_name,
                     baudrate=self.baud,
-                    timeout=1.0,
-                    write_timeout=1.0,
-                    inter_byte_timeout=0.5)
+                    timeout=0.1,
+                    write_timeout=0.1)
                 
-                if self._serial.is_open:
+                if self._serial.isOpen():
                     self._connected = True
-                    self._connection_attempts = 0
-                    self._last_read_time = time.time()
-                    self._last_comm_time = time.time()
-                    
-                    with self._info_lock:
-                        self._info['status'] = 'ready'
+                    self._info['status'] = 'ready'
                     logging.info(f"Connected to ACE at {self.serial_name}")
                     
-                    # Запуск потоков только если они не запущены
+                    # Запускаем потоки только если они еще не запущены
                     if not hasattr(self, '_writer_thread') or not self._writer_thread.is_alive():
                         self._writer_thread = threading.Thread(target=self._writer_loop)
                         self._writer_thread.daemon = True
@@ -171,39 +170,47 @@ class BunnyAce:
                     
             except SerialException as e:
                 logging.warning(f"Connection attempt {attempt + 1} failed: {str(e)}")
-                time.sleep(1.0)
+                time.sleep(1)
         
         logging.error("Failed to connect to ACE device")
         return False
 
     def _reconnect(self) -> bool:
-        """Безопасное переподключение с защитой от частых попыток"""
-        if self._connection_attempts >= self._max_connection_attempts * 2:
-            logging.error("Too many connection attempts, giving up")
-            return False
-
-        self._connection_attempts += 1
-        self._connected = False
+        """Безопасное переподключение"""
+        if not self._connected:
+            return self._connect()
         
         try:
-            if hasattr(self, '_serial'):
-                try:
-                    self._serial.close()
-                except:
-                    pass
-                del self._serial
-
-            time.sleep(1.0)  # Пауза перед повторной попыткой
+            # Сохраняем ссылки на старые потоки
+            old_writer = getattr(self, '_writer_thread', None)
+            old_reader = getattr(self, '_reader_thread', None)
             
-            return self._connect()
+            # Сбрасываем флаги перед новым подключением
+            self._connected = False
             
+            # Пытаемся подключиться
+            if self._connect():
+                # Аккуратно завершаем старые потоки
+                if old_writer and old_writer.is_alive() and old_writer != threading.current_thread():
+                    try:
+                        old_writer.join(timeout=0.5)
+                    except:
+                        pass
+                
+                if old_reader and old_reader.is_alive() and old_reader != threading.current_thread():
+                    try:
+                        old_reader.join(timeout=0.5)
+                    except:
+                        pass
+                
+                return True
+            return False
         except Exception as e:
             logging.error(f"Reconnect error: {str(e)}")
-            time.sleep(2.0)
             return False
 
     def _disconnect(self):
-        """Безопасное отключение с гарантированным закрытием порта"""
+        """Безопасное отключение"""
         if not self._connected:
             return
         
@@ -211,15 +218,11 @@ class BunnyAce:
         
         try:
             if hasattr(self, '_serial'):
-                try:
-                    self._serial.close()
-                except:
-                    pass
-                del self._serial
+                self._serial.close()
         except:
             pass
         
-        # Остановка потоков
+        # Не пытаемся завершить потоки из самих потоков
         current_thread = threading.current_thread()
         if hasattr(self, '_writer_thread') and self._writer_thread != current_thread:
             try:
@@ -233,50 +236,22 @@ class BunnyAce:
             except:
                 pass
         
-        # Отмена таймера
         if hasattr(self, 'main_timer'):
             try:
                 self.reactor.unregister_timer(self.main_timer)
             except:
                 pass
 
-    def _check_connection(self):
-        """Проверка состояния подключения"""
-        if not hasattr(self, '_serial') or not self._serial.is_open:
-            if not self._reconnect():
-                return False
-        
-        # Проверка на "зависшее" соединение
-        if time.time() - self._last_read_time > 5.0:  # 5 секунд без данных
-            logging.warning("No data received for 5 seconds, reconnecting...")
-            self._handle_serial_error()
-            return False
-            
-        return True
-
-    def _handle_serial_error(self):
-        """Обработка ошибок последовательного порта"""
-        self.lock = False
-        self._connected = False
-        if hasattr(self, '_serial'):
-            try:
-                self._serial.close()
-            except:
-                pass
-            del self._serial
-        self._reconnect()
-
     def _send_request(self, request: Dict[str, Any]) -> bool:
         """Отправка запроса с CRC проверкой"""
-        if not self._check_connection():
-            return False
+        if not self._connected and not self._reconnect():
+            raise SerialException("Device not connected")
 
-        with self._info_lock:
-            if 'id' not in request:
-                request['id'] = self._request_id
-                self._request_id += 1
-                if self._request_id >= 300000:
-                    self._request_id = 0
+        if 'id' not in request:
+            request['id'] = self._request_id
+            self._request_id += 1
+            if self._request_id >= 300000:
+                self._request_id = 0
 
         payload = json.dumps(request).encode('utf-8')
         crc = self._calc_crc(payload)
@@ -289,22 +264,17 @@ class BunnyAce:
             bytes([0xFE]))
         
         try:
-            if not self._check_connection():
-                return False
+            if not hasattr(self, '_serial') or not self._serial.is_open:
+                if not self._reconnect():
+                    return False
             
             self._serial.write(packet)
-            self._last_comm_time = time.time()
             self.send_time = time.time()
             self.lock = True
             return True
-            
-        except SerialException as e:
-            logging.error(f"Write error: {str(e)}, attempting reconnect")
-            self._handle_serial_error()
-            return False
-        except Exception as e:
-            logging.error(f"Unexpected write error: {str(e)}")
-            self._handle_serial_error()
+        except SerialException:
+            logging.error("Write error, attempting reconnect")
+            self._reconnect()
             return False
 
     def _calc_crc(self, buffer: bytes) -> int:
@@ -318,42 +288,25 @@ class BunnyAce:
         return crc
 
     def _reader_loop(self):
-        """Основной цикл чтения с защитой от частых ошибок"""
-        error_count = 0
+        """Основной цикл чтения"""
         while getattr(self, '_connected', False):
             try:
                 eventtime = self.reactor.monotonic()
                 next_eventtime = self._reader(eventtime)
-                
-                # Сброс счетчика ошибок при успешном чтении
-                error_count = 0
-                
                 time.sleep(max(0, next_eventtime - self.reactor.monotonic()))
             except Exception as e:
-                error_count += 1
-                logging.error(f"Reader loop error #{error_count}: {str(e)}")
-                if error_count > 5:
-                    logging.error("Too many reader errors, attempting reconnect")
-                    self._handle_serial_error()
-                    error_count = 0
-                time.sleep(1.0)
+                logging.error(f"Reader loop error: {str(e)}")
+                time.sleep(1)
 
     def _reader(self, eventtime):
-        """Улучшенный метод чтения с надежной обработкой ошибок"""
         buffer = bytearray()
-        
-        if not self._check_connection():
-            self.lock = False
-            return eventtime + 1.0
-
-        try:
-            # Чтение с таймаутом
-            raw_bytes = self._serial.read(size=4096)
-            self._last_read_time = time.time()
-            
-            if not raw_bytes:
-                # Если нет данных, но порт открыт - небольшая задержка
-                return eventtime + 0.1
+        while True:
+            try:
+                raw_bytes = self._serial.read(size=4096)
+            except SerialException:
+                self.gcode.respond_info("Unable to communicate with the ACE PRO" + traceback.format_exc())
+                self.lock = False
+                return eventtime + 0.5
 
             if len(raw_bytes):
                 text_buffer = self.read_buffer + raw_bytes
@@ -363,16 +316,9 @@ class BunnyAce:
                     self.read_buffer = bytearray()
                 else:
                     self.read_buffer += raw_bytes
-        except SerialException as e:
-            logging.error(f"Serial read error: {str(e)}")
-            self._handle_serial_error()
-            return eventtime + 1.0
-        except Exception as e:
-            logging.error(f"Unexpected read error: {str(e)}")
-            self._handle_serial_error()
-            return eventtime + 1.0
+            else:
+                break
 
-        # Обработка полученных данных
         if self.lock and (self.reactor.monotonic() - self.send_time) > 2:
             self.lock = False
             self.gcode.respond_info(f"timeout {self.reactor.monotonic()}")
@@ -384,6 +330,7 @@ class BunnyAce:
         if buffer[0:2] != bytes([0xFF, 0xAA]):
             self.lock = False
             self.gcode.respond_info("Invalid data from ACE PRO (head bytes)")
+            self.gcode.respond_info(str(buffer))
             return eventtime + 0.1
 
         payload_len = struct.unpack('<H', buffer[2:4])[0]
@@ -394,6 +341,7 @@ class BunnyAce:
         if len(buffer) < (4 + payload_len + 2 + 1):
             self.lock = False
             self.gcode.respond_info(f"Invalid data from ACE PRO (len) {payload_len} {len(buffer)} {crc}")
+            self.gcode.respond_info(str(buffer))
             return eventtime + 0.1
 
         if crc_data != crc:
@@ -404,9 +352,9 @@ class BunnyAce:
         try:
             response = json.loads(payload.decode('utf-8'))
 
+            # Обработка парковки филамента
             if self._park_in_progress and 'result' in response:
-                with self._info_lock:
-                    self._info = response['result']
+                self._info = response['result']
                 if self._info['status'] == 'ready':
                     new_assist_count = self._info.get('feed_assist_count', 0)
 
@@ -420,10 +368,11 @@ class BunnyAce:
                     else:
                         self._complete_parking()
 
+            # Вызываем callback с ответом
             if 'id' in response and response['id'] in self._callback_map:
-                callback = self._callback_map.pop(response['id'])['callback']
+                callback = self._callback_map.pop(response['id'])
                 try:
-                    callback(response)
+                    callback(response)  # Передаем только response
                 except Exception as e:
                     logging.error(f"Callback error: {str(e)}")
 
@@ -448,7 +397,7 @@ class BunnyAce:
             if self._park_is_toolchange:
                 self._park_is_toolchange = False
                 def post_toolchange():
-                    self.gcode.run_script(
+                    self.gcode.run_script_from_command(
                         f'_ACE_POST_TOOLCHANGE FROM={self._park_previous_tool} TO={self._park_index}')
                 self._main_queue.put(post_toolchange)
                 
@@ -464,51 +413,44 @@ class BunnyAce:
         }, stop_callback)
 
     def _writer_loop(self):
-        """Цикл записи с улучшенной обработкой ошибок"""
-        error_count = 0
+        """Безопасный цикл записи"""
         while getattr(self, '_connected', False):
             try:
-                if not self._check_connection():
-                    time.sleep(1.0)
-                    continue
+                if not self._queue.empty():
+                    task = self._queue.get_nowait()
+                    if task:
+                        request, callback = task
+                        self._callback_map[request['id']] = callback
+                        if not self._send_request(request):
+                            continue
                 
-                with self._command_lock:
-                    if not self._queue.empty():
-                        task = self._queue.get_nowait()
-                        if task:
-                            request, callback_data = task
-                            self._callback_map[request['id']] = {
-                                'callback': callback_data['callback'],
-                                'timestamp': time.time()
-                            }
-                            if not self._send_request(request):
-                                continue
+                # Периодический запрос статуса
+                def status_callback(response):
+                    if 'result' in response:
+                        self._info = response['result']
                 
-                # Сброс счетчика ошибок при успешной записи
-                error_count = 0
-                time.sleep(0.1)
+                self.send_request({
+                    "id": self._request_id,
+                    "method": "get_status"
+                }, status_callback)
                 
-            except SerialException as e:
-                error_count += 1
-                logging.error(f"Serial write error #{error_count}: {str(e)}")
-                self._handle_serial_error()
-                if error_count > 3:
-                    time.sleep(2.0)
+                # Безопасная задержка
+                time.sleep(0.25 if not self._park_in_progress else 0.68)
+
+            except SerialException:
+                logging.error("Serial write error")
+                if self._connected:
+                    self._reconnect()
             except Exception as e:
-                error_count += 1
-                logging.error(f"Writer loop error #{error_count}: {str(e)}")
-                if error_count > 3:
-                    time.sleep(2.0)
+                logging.error(f"Writer loop error: {str(e)}")
+                time.sleep(1)
 
     def _main_eval(self, eventtime):
         """Обработка задач в основном потоке"""
         while not self._main_queue.empty():
             task = self._main_queue.get_nowait()
             if task:
-                try:
-                    task()
-                except Exception as e:
-                    logging.error(f"Error in main queue task: {str(e)}")
+                task()
         return eventtime + 0.25
 
     def _handle_ready(self):
@@ -526,31 +468,17 @@ class BunnyAce:
         if not self._connected and not self._reconnect():
             raise SerialException("Device not connected")
         
-        with self._command_lock:
-            if 'id' not in request:
-                with self._info_lock:
-                    request['id'] = self._request_id
-                    self._request_id += 1
-            
-            # Очистка очереди при переполнении
-            if self._queue.qsize() > 10:
-                logging.warning("Cleaning command queue overflow")
-                self._queue = queue.Queue()
-                self._callback_map.clear()
-            
-            self._queue.put((request, {
-                'callback': callback,
-                'timestamp': time.time()
-            }))
+        if 'id' not in request:
+            request['id'] = self._request_id
+            self._request_id += 1
+        
+        self._queue.put((request, callback))
 
     def dwell(self, delay: float = 1.0, on_main: bool = False):
         """Пауза с возможностью выполнения в основном потоке"""
         toolhead = self.printer.lookup_object('toolhead')
         def main_callback():
-            try:
-                toolhead.dwell(delay)
-            except Exception as e:
-                logging.error(f"Dwell error: {str(e)}")
+            toolhead.dwell(delay)
         
         if on_main:
             self._main_queue.put(main_callback)
@@ -562,8 +490,7 @@ class BunnyAce:
     cmd_ACE_STATUS_help = "Get current device status"
     def cmd_ACE_STATUS(self, gcmd):
         """Обработчик команды ACE_STATUS"""
-        with self._info_lock:
-            status = json.dumps(self._info, indent=2)
+        status = json.dumps(self._info, indent=2)
         gcmd.respond_info(f"ACE Status:\n{status}")
 
     cmd_ACE_DEBUG_help = "Debug ACE connection"
@@ -572,10 +499,11 @@ class BunnyAce:
         method = gcmd.get('METHOD')
         params = gcmd.get('PARAMS', '{}')
         
+        # Создаем event для ожидания ответа
         response_event = threading.Event()
         response_data = [None]
 
-        def callback(response):
+        def callback(response):  # Теперь принимает только response
             response_data[0] = response
             response_event.set()
 
@@ -615,6 +543,7 @@ class BunnyAce:
                     output.append(f"Temperature: {result.get('temp', 'Unknown')}")
                     output.append(f"Fan Speed: {result.get('fan_speed', 'Unknown')}")
                     
+                    # Добавляем информацию о слотах
                     for slot in result.get('slots', []):
                         output.append(f"\nSlot {slot.get('index', '?')}:")
                         output.append(f"  Status: {slot.get('status', 'Unknown')}")
@@ -631,33 +560,23 @@ class BunnyAce:
     cmd_ACE_FILAMENT_INFO_help = 'ACE_FILAMENT_INFO INDEX='
     def cmd_ACE_FILAMENT_INFO(self, gcmd):
         """Handler for ACE_FILAMENT_INFO command - get detailed filament slot info"""
+        index = gcmd.get_int('INDEX', minval=0, maxval=3)
         try:
-            index = gcmd.get_int('INDEX', minval=0, maxval=3)
-            if index not in range(4):
-                gcmd.respond_error("Invalid INDEX (0-3 allowed)")
-                return
-                
             def callback(response):
-                try:
-                    if 'result' in response:
-                        slot_info = response['result']
-                        logging.info(f'ACE: FILAMENT SLOT {index} STATUS: {slot_info}')
-                        gcmd.respond_info(f"Slot {index} info:\n{json.dumps(slot_info, indent=2)}")
-                    elif 'error' in response:
-                        gcmd.respond_error(f"Device error: {response['error']}")
-                    else:
-                        gcmd.respond_error("Invalid response format from device")
-                except Exception as e:
-                    logging.error(f"Callback processing error: {str(e)}")
-                    gcmd.respond_error("Error processing response")
+                if 'result' in response:
+                    slot_info = response['result']
+                    self.gcode.respond_info(str(slot_info))
+                    logging.info('ACE: FILAMENT SLOT STATUS: ' + str(slot_info))
+                    self.gcode.respond_info('ACE:'+ str(slot_info))
+                else:
+                    self.gcode.respond_info('Error: No result in response')
 
             self.send_request(
                 request={"method": "get_filament_info", "params": {"index": index}},
                 callback=callback
             )
         except Exception as e:
-            logging.error(f"ACE_FILAMENT_INFO error: {str(e)}")
-            gcmd.respond_error(f"Command error: {str(e)}")
+            self.gcode.respond_info('Error: ' + str(e))
 
     cmd_ACE_START_DRYING_help = "Start filament drying"
     def cmd_ACE_START_DRYING(self, gcmd):
@@ -754,7 +673,7 @@ class BunnyAce:
         index = gcmd.get_int('INDEX', minval=0, maxval=3)
         
         if self._info['slots'][index]['status'] != 'ready':
-            self.gcode.run_script(f"_ACE_ON_EMPTY_ERROR INDEX={index}")
+            gcmd.run_script_from_command(f"_ACE_ON_EMPTY_ERROR INDEX={index}")
             return
 
         self._park_to_toolhead(index)
@@ -804,67 +723,49 @@ class BunnyAce:
     cmd_ACE_CHANGE_TOOL_help = "Change tool"
     def cmd_ACE_CHANGE_TOOL(self, gcmd):
         """Обработчик команды ACE_CHANGE_TOOL"""
-        try:
-            tool = gcmd.get_int('TOOL', minval=-1, maxval=3)
-            was = self.variables.get('ace_current_index', -1)
+        tool = gcmd.get_int('TOOL', minval=-1, maxval=3)
+        was = self.variables.get('ace_current_index', -1)
+        
+        if was == tool:
+            gcmd.respond_info(f"Tool already set to {tool}")
+            return
+        
+        if tool != -1 and self._info['slots'][tool]['status'] != 'ready':
+            gcmd.run_script_from_command(f"_ACE_ON_EMPTY_ERROR INDEX={tool}")
+            return
+
+        gcmd.run_script_from_command(f"_ACE_PRE_TOOLCHANGE FROM={was} TO={tool}")
+        self._park_is_toolchange = True
+        self._park_previous_tool = was
+        self.variables['ace_current_index'] = tool
+        gcmd.run_script_from_command(f'SAVE_VARIABLE VARIABLE=ace_current_index VALUE={tool}')
+
+        def callback(response):
+            if response.get('code', 0) != 0:
+                gcmd.respond_error(f"ACE Error: {response.get('msg', 'Unknown error')}")
+
+        if was != -1:
+            self.send_request({
+                "method": "unwind_filament",
+                "params": {
+                    "index": was,
+                    "length": self.toolchange_retract_length,
+                    "speed": self.retract_speed
+                }
+            }, callback)
+            self.dwell((self.toolchange_retract_length / self.retract_speed) + 0.1)
+
+            while self._info['status'] != 'ready':
+                self.dwell(1.0)
             
-            if was == tool:
-                gcmd.respond_info(f"Tool already set to {tool}")
-                return
-            
-            # Проверка состояния слота
+            self.dwell(0.25)
+
             if tool != -1:
-                with self._info_lock:
-                    if self._info['slots'][tool]['status'] != 'ready':
-                        self.gcode.run_script(f"_ACE_ON_EMPTY_ERROR INDEX={tool}")
-                        return
-
-            # Подготовка к смене инструмента
-            self.gcode.run_script(f"_ACE_PRE_TOOLCHANGE FROM={was} TO={tool}")
-            self._park_is_toolchange = True
-            self._park_previous_tool = was
-            self.variables['ace_current_index'] = tool
-            self.gcode.run_script(f'SAVE_VARIABLE VARIABLE=ace_current_index VALUE={tool}')
-
-            def retract_callback(response):
-                if response.get('code', 0) != 0:
-                    gcmd.respond_error(f"Retract error: {response.get('msg', 'Unknown error')}")
-                    return
-                
-                # Асинхронная проверка статуса
-                def check_status():
-                    if self._info['status'] == 'ready':
-                        if tool != -1:
-                            self.gcode.run_script(f'ACE_PARK_TO_TOOLHEAD INDEX={tool}')
-                        else:
-                            self.gcode.run_script(f'_ACE_POST_TOOLCHANGE FROM={was} TO={tool}')
-                    else:
-                        self.reactor.register_timer(lambda e: check_status(), self.reactor.NOW + 0.5)
-                
-                check_status()
-
-            if was != -1:
-                # Отправляем команду ретракта с callback
-                self.send_request({
-                    "method": "unwind_filament",
-                    "params": {
-                        "index": was,
-                        "length": self.toolchange_retract_length,
-                        "speed": self.retract_speed
-                    }
-                }, retract_callback)
-                
-                # Добавляем небольшую задержку перед следующей операцией
-                self.dwell((self.toolchange_retract_length / self.retract_speed) + 0.1)
+                gcmd.run_script_from_command(f'ACE_PARK_TO_TOOLHEAD INDEX={tool}')
             else:
-                # Если не было предыдущего инструмента, просто паркуем новый
-                self._park_to_toolhead(tool)
-
-        except Exception as e:
-            logging.error(f"ACE_CHANGE_TOOL error: {str(e)}")
-            gcmd.respond_error(f"Tool change failed: {str(e)}")
-            # Пытаемся восстановить соединение
-            self._reconnect()
+                gcmd.run_script_from_command(f'_ACE_POST_TOOLCHANGE FROM={was} TO={tool}')
+        else:
+            self._park_to_toolhead(tool)
 
 def load_config(config):
     return BunnyAce(config)
