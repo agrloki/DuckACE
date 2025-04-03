@@ -122,6 +122,7 @@ class BunnyAce:
             ('ACE_FEED', self.cmd_ACE_FEED, "Feed filament"),
             ('ACE_RETRACT', self.cmd_ACE_RETRACT, "Retract filament"),
             ('ACE_CHANGE_TOOL', self.cmd_ACE_CHANGE_TOOL, "Change tool"),
+            ('ACE_FILAMENT_INFO', self.cmd_ACE_FILAMENT_INFO, "Show filament info"),
         ]
         
         for name, func, desc in commands:
@@ -555,6 +556,27 @@ class BunnyAce:
 
         except Exception as e:
             gcmd.respond_error(f"Error: {str(e)}")
+
+    cmd_ACE_FILAMENT_INFO_help = 'ACE_FILAMENT_INFO INDEX='
+    def cmd_ACE_FILAMENT_INFO(self, gcmd):
+        """Handler for ACE_FILAMENT_INFO command - get detailed filament slot info"""
+        index = gcmd.get_int('INDEX', minval=0, maxval=3)
+        try:
+            def callback(response):
+                if 'result' in response:
+                    slot_info = response['result']
+                    self.gcode.respond_info(str(slot_info))
+                    logging.info('ACE: FILAMENT SLOT STATUS: ' + str(slot_info))
+                    self.gcode.respond_info('ACE:'+ str(slot_info))
+                else:
+                    self.gcode.respond_info('Error: No result in response')
+
+            self.send_request(
+                request={"method": "get_filament_info", "params": {"index": index}},
+                callback=callback
+            )
+        except Exception as e:
+            self.gcode.respond_info('Error: ' + str(e))
 
     cmd_ACE_START_DRYING_help = "Start filament drying"
     def cmd_ACE_START_DRYING(self, gcmd):
