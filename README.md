@@ -6,6 +6,8 @@
 
 Но заложенная автором философия проекта по возможности была сохранена.
 
+## English
+
 The refactored code no longer contains any of the original source code from the DuckACE project. The new version features:
 
 A completely rewritten serial communication interface
