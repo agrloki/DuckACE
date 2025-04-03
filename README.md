@@ -1,3 +1,21 @@
+# WORK Stopped! This repo is deprecated!! Actual repo https://github.com/agrloki/ValgACE
+# Работы по данному драйверу прекращены. Актуальный драйвер в репо https://github.com/agrloki/ValgACE
+Причина прекращения работ, переработанный код фактически не содержит в себе исходного кода от проекта DuckACE.
+
+В новой версии полностью переписано взаимодействие с serial, а также внесены значительные изменения в код функций.
+
+Но заложенная автором философия проекта по возможности была сохранена.
+
+The refactored code no longer contains any of the original source code from the DuckACE project. The new version features:
+
+A completely rewritten serial communication interface
+
+Significant modifications to core functionality and command handling
+
+As a result, this implementation has diverged substantially from its original foundation.
+
+However, the original philosophical approach of the project's author has been preserved to the greatest extent possible.
+
 # DuckACE
 
 A Work-In-Progress driver for Anycubic Color Engine Pro for Klipper
