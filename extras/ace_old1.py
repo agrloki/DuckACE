@@ -24,7 +24,6 @@ class BunnyAce:
         self.lock = False
         self.read_buffer = bytearray()
         self.send_time = 0
-        self._info_lock = threading.Lock()
 
         # Автопоиск устройства
         default_serial = self._find_ace_device()
@@ -144,8 +143,7 @@ class BunnyAce:
                 
                 if self._serial.isOpen():
                     self._connected = True
-                    with self._info_lock:
-                        self._info['status'] = 'ready'
+                    self._info['status'] = 'ready'
                     logging.info(f"Connected to ACE at {self.serial_name}")
                     
                     # Запускаем потоки только если они еще не запущены
@@ -250,11 +248,10 @@ class BunnyAce:
             raise SerialException("Device not connected")
 
         if 'id' not in request:
-            with self._info_lock:
-                request['id'] = self._request_id
-                self._request_id += 1
-                if self._request_id >= 300000:
-                    self._request_id = 0
+            request['id'] = self._request_id
+            self._request_id += 1
+            if self._request_id >= 300000:
+                self._request_id = 0
 
         payload = json.dumps(request).encode('utf-8')
         crc = self._calc_crc(payload)
@@ -294,12 +291,6 @@ class BunnyAce:
         """Основной цикл чтения"""
         while getattr(self, '_connected', False):
             try:
-                # Cleanup old callbacks (older than 5 minutes)
-                now = time.time()
-                for req_id in list(self._callback_map.keys()):
-                    if now - self._callback_map[req_id]['timestamp'] > 300:
-                        del self._callback_map[req_id]
-                
                 eventtime = self.reactor.monotonic()
                 next_eventtime = self._reader(eventtime)
                 time.sleep(max(0, next_eventtime - self.reactor.monotonic()))
@@ -363,8 +354,7 @@ class BunnyAce:
 
             # Обработка парковки филамента
             if self._park_in_progress and 'result' in response:
-                with self._info_lock:
-                    self._info = response['result']
+                self._info = response['result']
                 if self._info['status'] == 'ready':
                     new_assist_count = self._info.get('feed_assist_count', 0)
 
@@ -380,9 +370,9 @@ class BunnyAce:
 
             # Вызываем callback с ответом
             if 'id' in response and response['id'] in self._callback_map:
-                callback = self._callback_map.pop(response['id'])['callback']
+                callback = self._callback_map.pop(response['id'])
                 try:
-                    callback(response)
+                    callback(response)  # Передаем только response
                 except Exception as e:
                     logging.error(f"Callback error: {str(e)}")
 
@@ -407,7 +397,7 @@ class BunnyAce:
             if self._park_is_toolchange:
                 self._park_is_toolchange = False
                 def post_toolchange():
-                    self.gcode.run_script(
+                    self.gcode.run_script_from_command(
                         f'_ACE_POST_TOOLCHANGE FROM={self._park_previous_tool} TO={self._park_index}')
                 self._main_queue.put(post_toolchange)
                 
@@ -430,18 +420,14 @@ class BunnyAce:
                     task = self._queue.get_nowait()
                     if task:
                         request, callback = task
-                        self._callback_map[request['id']] = {
-                            'callback': callback,
-                            'timestamp': time.time()
-                        }
+                        self._callback_map[request['id']] = callback
                         if not self._send_request(request):
                             continue
                 
                 # Периодический запрос статуса
                 def status_callback(response):
                     if 'result' in response:
-                        with self._info_lock:
-                            self._info = response['result']
+                        self._info = response['result']
                 
                 self.send_request({
                     "id": self._request_id,
@@ -464,10 +450,7 @@ class BunnyAce:
         while not self._main_queue.empty():
             task = self._main_queue.get_nowait()
             if task:
-                try:
-                    task()
-                except Exception as e:
-                    logging.error(f"Error in main queue task: {str(e)}")
+                task()
         return eventtime + 0.25
 
     def _handle_ready(self):
@@ -486,9 +469,8 @@ class BunnyAce:
             raise SerialException("Device not connected")
         
         if 'id' not in request:
-            with self._info_lock:
-                request['id'] = self._request_id
-                self._request_id += 1
+            request['id'] = self._request_id
+            self._request_id += 1
         
         self._queue.put((request, callback))
 
@@ -496,10 +478,7 @@ class BunnyAce:
         """Пауза с возможностью выполнения в основном потоке"""
         toolhead = self.printer.lookup_object('toolhead')
         def main_callback():
-            try:
-                toolhead.dwell(delay)
-            except Exception as e:
-                logging.error(f"Dwell error: {str(e)}")
+            toolhead.dwell(delay)
         
         if on_main:
             self._main_queue.put(main_callback)
@@ -511,8 +490,7 @@ class BunnyAce:
     cmd_ACE_STATUS_help = "Get current device status"
     def cmd_ACE_STATUS(self, gcmd):
         """Обработчик команды ACE_STATUS"""
-        with self._info_lock:
-            status = json.dumps(self._info, indent=2)
+        status = json.dumps(self._info, indent=2)
         gcmd.respond_info(f"ACE Status:\n{status}")
 
     cmd_ACE_DEBUG_help = "Debug ACE connection"
@@ -525,7 +503,7 @@ class BunnyAce:
         response_event = threading.Event()
         response_data = [None]
 
-        def callback(response):
+        def callback(response):  # Теперь принимает только response
             response_data[0] = response
             response_event.set()
 
@@ -582,33 +560,23 @@ class BunnyAce:
     cmd_ACE_FILAMENT_INFO_help = 'ACE_FILAMENT_INFO INDEX='
     def cmd_ACE_FILAMENT_INFO(self, gcmd):
         """Handler for ACE_FILAMENT_INFO command - get detailed filament slot info"""
+        index = gcmd.get_int('INDEX', minval=0, maxval=3)
         try:
-            index = gcmd.get_int('INDEX', minval=0, maxval=3)
-            if index not in range(4):
-                gcmd.respond_error("Invalid INDEX (0-3 allowed)")
-                return
-                
             def callback(response):
-                try:
-                    if 'result' in response:
-                        slot_info = response['result']
-                        logging.info(f'ACE: FILAMENT SLOT {index} STATUS: {slot_info}')
-                        gcmd.respond_info(f"Slot {index} info:\n{json.dumps(slot_info, indent=2)}")
-                    elif 'error' in response:
-                        gcmd.respond_error(f"Device error: {response['error']}")
-                    else:
-                        gcmd.respond_error("Invalid response format from device")
-                except Exception as e:
-                    logging.error(f"Callback processing error: {str(e)}")
-                    gcmd.respond_error("Error processing response")
+                if 'result' in response:
+                    slot_info = response['result']
+                    self.gcode.respond_info(str(slot_info))
+                    logging.info('ACE: FILAMENT SLOT STATUS: ' + str(slot_info))
+                    self.gcode.respond_info('ACE:'+ str(slot_info))
+                else:
+                    self.gcode.respond_info('Error: No result in response')
 
             self.send_request(
                 request={"method": "get_filament_info", "params": {"index": index}},
                 callback=callback
             )
         except Exception as e:
-            logging.error(f"ACE_FILAMENT_INFO error: {str(e)}")
-            gcmd.respond_error(f"Command error: {str(e)}")
+            self.gcode.respond_info('Error: ' + str(e))
 
     cmd_ACE_START_DRYING_help = "Start filament drying"
     def cmd_ACE_START_DRYING(self, gcmd):
@@ -705,7 +673,7 @@ class BunnyAce:
         index = gcmd.get_int('INDEX', minval=0, maxval=3)
         
         if self._info['slots'][index]['status'] != 'ready':
-            self.gcode.run_script(f"_ACE_ON_EMPTY_ERROR INDEX={index}")
+            gcmd.run_script_from_command(f"_ACE_ON_EMPTY_ERROR INDEX={index}")
             return
 
         self._park_to_toolhead(index)
@@ -798,6 +766,6 @@ class BunnyAce:
                 self.gcode.run_script(f'_ACE_POST_TOOLCHANGE FROM={was} TO={tool}')
         else:
             self._park_to_toolhead(tool)
-
+            
 def load_config(config):
     return BunnyAce(config)
